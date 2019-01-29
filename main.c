@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include "MobileDevice.h"
+#include <regex.h>
 
 typedef struct {
     service_conn_t connection;
@@ -13,8 +14,16 @@ static CFMutableDictionaryRef liveConnections;
 static int debug;
 static CFStringRef requiredDeviceId;
 static char *requiredProcessName;
+static char *includeStrPattern;
+static char *excludeStrPattern;
+static regex_t requiredProcessNamePattern;
+static regex_t includePattern;
+static regex_t excludePattern;
 static void (*printMessage)(int fd, const char *, size_t);
 static void (*printSeparator)(int fd);
+
+// match all strings regexp
+static const char *match_all = ".*";
 
 static inline void write_fully(int fd, const char *buffer, size_t length)
 {
@@ -45,34 +54,52 @@ static int find_space_offsets(const char *buffer, size_t length, size_t *space_o
     }
     return o;
 }
+
 static unsigned char should_print_message(const char *buffer, size_t length)
 {
     if (length < 3) return 0; // don't want blank lines
-    
+
     size_t space_offsets[3];
     find_space_offsets(buffer, length, space_offsets);
-    
+
     // Check whether process name matches the one passed to -p option and filter if needed
     if (requiredProcessName != NULL) {
         int nameLength = space_offsets[1] - space_offsets[0]; //This size includes the NULL terminator.
-        
+
         char *processName = malloc(nameLength);
+        if (!processName) {
+            fprintf(stderr, "Failed to allocate memory for processName\n");
+            return 0;
+        }
         processName[nameLength - 1] = '\0';
         memcpy(processName, buffer + space_offsets[0] + 1, nameLength - 1);
 
         for (int i = strlen(processName); i != 0; i--)
             if (processName[i] == '[')
                 processName[i] = '\0';
-        
-        if (strcmp(processName, requiredProcessName) != 0){
-            free(processName);
+
+        if (regexec(&requiredProcessNamePattern, processName, 0, NULL, 0)) {
             return 0;
         }
         free(processName);
     }
-    
-    // More filtering options can be added here and return 0 when they won't meed filter criteria
-    
+
+    if (excludeStrPattern != NULL) {
+         // if exclude pattern DOES match, dont print anything
+        if (!regexec(&excludePattern, buffer, 0, NULL, 0)) {
+            return 0;
+        }
+    }
+
+    if (includeStrPattern != NULL) {
+         // if include pattern DOES NOT match, dont print anything
+        if (regexec(&includePattern, buffer, 0, NULL, 0)){
+            return 0;
+        }
+    }
+
+    // More filtering options can be added here and return 0 when they won't meet filtering criteria
+
     return 1;
 }
 
@@ -104,9 +131,9 @@ static void write_colored(int fd, const char *buffer, size_t length)
     }
     size_t space_offsets[3];
     int o = find_space_offsets(buffer, length, space_offsets);
-    
+
     if (o == 3) {
-        
+
         // Log date and device name
         write_const(fd, COLOR_DARK_WHITE);
         write_fully(fd, buffer, space_offsets[0]);
@@ -165,10 +192,12 @@ static void write_colored(int fd, const char *buffer, size_t length)
         write_fully(fd, buffer, length);
     }
 }
+
 static void SocketCallback(CFSocketRef s, CFSocketCallBackType type, CFDataRef address, const void *data, void *info)
 {
     // Skip null bytes
     ssize_t length = CFDataGetLength(data);
+    printf("CFDataGetLength: %zd\n", length);
     const char *buffer = (const char *)CFDataGetBytePtr(data);
     while (length) {
         while (*buffer == '\0') {
@@ -181,12 +210,12 @@ static void SocketCallback(CFSocketRef s, CFSocketCallBackType type, CFDataRef a
         while ((buffer[extentLength] != '\0') && extentLength != length) {
             extentLength++;
         }
-        
+
         if (should_print_message(buffer, extentLength)) {
             printMessage(1, buffer, extentLength);
             printSeparator(1);
         }
-        
+
         length -= extentLength;
         buffer += extentLength;
     }
@@ -223,6 +252,10 @@ static void DeviceNotificationCallback(am_device_notification_callback_info *inf
                                     CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
                                     AMDeviceRetain(device);
                                     DeviceConsoleConnection *data = malloc(sizeof *data);
+                                    if (!data) {
+                                        fprintf(stderr, "Failed to allocate memory for DeviceConsoleConnection\n");
+                                        return;
+                                    }
                                     data->connection = connection;
                                     data->socket = socket;
                                     data->source = source;
@@ -279,17 +312,31 @@ static void color_separator(int fd)
     write_const(fd, COLOR_DARK_WHITE "--" COLOR_RESET "\n");
 }
 
+#define MAX_ERROR_MSG 0x1000
+
+static int compile_regexp(regex_t * r, const char * regex_text)
+{
+    int status = regcomp(r, regex_text, REG_EXTENDED|REG_NEWLINE);
+    if (status != 0) {
+	char error_message[MAX_ERROR_MSG];
+	regerror(status, r, error_message, MAX_ERROR_MSG);
+        fprintf(stderr, "Regexp error compiling '%s': %s\n", regex_text, error_message);
+        return 1;
+    }
+    return 0;
+}
+
 int main (int argc, char * const argv[])
 {
     if ((argc == 2) && (strcmp(argv[1], "--help") == 0)) {
-        fprintf(stderr, "Usage: %s [options]\nOptions:\n -d\t\t\tInclude connect/disconnect messages in standard out\n -u <udid>\t\tShow only logs from a specific device\n -p <process name>\tShow only logs from a specific process\n\nControl-C to disconnect\nMail bug reports and suggestions to <ryan.petrich@medialets.com>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options]\nOptions:\n -d\t\t\tInclude connect/disconnect messages in standard out\n -u <udid>\t\tShow only logs from a specific device\n -p <process name>\tShow only logs from a specific process\n -f <regexp>\t\tInclude output that matches <regexp>\n -x <regexp>\t\tExclude output that matches <regexp>\n\nControl-C to disconnect\nMail bug reports and suggestions to <ryan.petrich@medialets.com>\n", argv[0]);
         return 1;
     }
     int c;
     bool use_separators = false;
     bool force_color = false;
 
-    while ((c = getopt(argc, argv, "dcsu:p:")) != -1)
+    while ((c = getopt(argc, argv, "dcsu:p:f:x:")) != -1)
         switch (c)
     {
         case 'd':
@@ -307,10 +354,59 @@ int main (int argc, char * const argv[])
             requiredDeviceId = CFStringCreateWithCString(kCFAllocatorDefault, optarg, kCFStringEncodingASCII);
             break;
         case 'p':
-            requiredProcessName = malloc(strlen(optarg) + 1);
-            requiredProcessName[strlen(optarg)] = '\0';
+            if (optarg) {
+                requiredProcessName = malloc(strlen(optarg) + 1);
+                if (!requiredProcessName) {
+                    fprintf(stderr, "Failed to allocate memory for requiredProcessName\n");
+                    return 0;
+                }
+                requiredProcessName[strlen(optarg)] = '\0';
+                strcpy(requiredProcessName, optarg);
+            } else {
+                requiredProcessName = malloc(strlen(match_all) + 1);
+                if (!requiredProcessName) {
+                    fprintf(stderr, "Failed to allocate memory for requiredProcessName\n");
+                    return 0;
+                }
+                requiredProcessName[strlen(match_all)] = '\0';
+                strcpy(requiredProcessName, match_all);
+            }
 
-            strcpy(requiredProcessName, optarg);
+            if (compile_regexp(&requiredProcessNamePattern, requiredProcessName)) {
+                return 1;
+            }
+            break;
+        case 'f':
+            if (optarg) {
+                includeStrPattern = malloc(strlen(optarg) + 1);
+                if (!includeStrPattern) {
+                    fprintf(stderr, "Failed to allocate memory for includeStrPattern\n");
+                    return 0;
+                }
+                includeStrPattern[strlen(optarg)] = '\0';
+                strcpy(includeStrPattern, optarg);
+
+                if (compile_regexp(&includePattern, includeStrPattern)) {
+                    return 1;
+                }
+            }
+
+            break;
+        case 'x':
+            if (optarg) {
+                excludeStrPattern = malloc(strlen(optarg) + 1);
+                if (!excludeStrPattern) {
+                    fprintf(stderr, "Failed to allocate memory for excludeStrPattern\n");
+                    return 0;
+                }
+                excludeStrPattern[strlen(optarg)] = '\0';
+                strcpy(excludeStrPattern, optarg);
+
+                if (compile_regexp(&excludePattern, excludeStrPattern)) {
+                    return 1;
+                }
+            }
+
             break;
         case '?':
             if (optopt == 'u')
@@ -323,6 +419,7 @@ int main (int argc, char * const argv[])
         default:
             abort();
     }
+
     if (force_color || isatty(1)) {
         printMessage = &write_colored;
         printSeparator = use_separators ? &color_separator : &no_separator;
@@ -330,9 +427,11 @@ int main (int argc, char * const argv[])
         printMessage = &write_fully;
         printSeparator = use_separators ? &plain_separator : &no_separator;
     }
+
     liveConnections = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
     am_device_notification *notification;
     AMDeviceNotificationSubscribe(DeviceNotificationCallback, 0, 0, NULL, &notification);
     CFRunLoopRun();
+
     return 0;
 }
