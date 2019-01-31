@@ -14,16 +14,14 @@ static CFMutableDictionaryRef liveConnections;
 static int debug;
 static CFStringRef requiredDeviceId;
 static char *requiredProcessName;
-static char *includeStrPattern;
-static char *excludeStrPattern;
 static regex_t requiredProcessNamePattern;
-static regex_t includePattern;
-static regex_t excludePattern;
+static regex_t monthDayPattern;
 static void (*printMessage)(int fd, const char *, size_t);
 static void (*printSeparator)(int fd);
 
-// match all strings regexp
+static int matched = 0;
 static const char *match_all = ".*";
+static const char *month_day = "([Jj]an(uary|uar)?|[Ff]eb(ruary|ruar)?|[Mm](a|ä)?r(ch|z)?|[Aa]pr(il)?|[Mm]a(y|i)?|[Jj]un(e|i)?|[Jj]ul(y)?|[Aa]ug(ust)?|[Ss]ep(tember)?|[Oo](c|k)?t(ober)?|[Nn]ov(ember)?|[Dd]e(c|z)(ember)?).*";
 
 static inline void write_fully(int fd, const char *buffer, size_t length)
 {
@@ -66,37 +64,37 @@ static unsigned char should_print_message(const char *buffer, size_t length)
     if (requiredProcessName != NULL) {
         int nameLength = space_offsets[1] - space_offsets[0]; //This size includes the NULL terminator.
 
+        //printf("should_print_message nameLength: %d\n", nameLength);
+
         char *processName = malloc(nameLength);
         if (!processName) {
             fprintf(stderr, "Failed to allocate memory for processName\n");
             return 0;
         }
+
+        //printf("should_print_message pre-memcpy\n");
+
         processName[nameLength - 1] = '\0';
         memcpy(processName, buffer + space_offsets[0] + 1, nameLength - 1);
+
+        //printf("should_print_message post-memcpy\n");
 
         for (int i = strlen(processName); i != 0; i--)
             if (processName[i] == '[')
                 processName[i] = '\0';
 
+        //printf("should_print_message pre-regex\n");
         if (regexec(&requiredProcessNamePattern, processName, 0, NULL, 0)) {
+            //printf("should_print_message post-regex\n");
+            matched = 0;
             return 0;
         }
+        // process regex has been matched
         free(processName);
     }
 
-    if (excludeStrPattern != NULL) {
-         // if exclude pattern DOES match, dont print anything
-        if (!regexec(&excludePattern, buffer, 0, NULL, 0)) {
-            return 0;
-        }
-    }
-
-    if (includeStrPattern != NULL) {
-         // if include pattern DOES NOT match, dont print anything
-        if (regexec(&includePattern, buffer, 0, NULL, 0)){
-            return 0;
-        }
-    }
+    // proceed with printing
+    matched = 1;
 
     // More filtering options can be added here and return 0 when they won't meet filtering criteria
 
@@ -197,24 +195,43 @@ static void SocketCallback(CFSocketRef s, CFSocketCallBackType type, CFDataRef a
 {
     // Skip null bytes
     ssize_t length = CFDataGetLength(data);
-    printf("CFDataGetLength: %zd\n", length);
     const char *buffer = (const char *)CFDataGetBytePtr(data);
+
     while (length) {
+        // skip zero bytes
         while (*buffer == '\0') {
             buffer++;
             length--;
             if (length == 0)
                 return;
         }
+
         size_t extentLength = 0;
         while ((buffer[extentLength] != '\0') && extentLength != length) {
             extentLength++;
         }
 
-        if (should_print_message(buffer, extentLength)) {
+        //printf("SocketCallback pre-should_print_message\n");
+
+        //printf("Buffer: %s, extentLength: %zu\n", buffer, extentLength);
+
+
+        // only check the printing if it's a new message i.e. starts with "MMM DD"
+        if ((extentLength > 16) && (!regexec(&monthDayPattern, buffer, 0, NULL, 0))) {
+            //printf("monthDayPattern Match found\n");
+            if (should_print_message(buffer, extentLength)) {
+                //printf("SocketCallback pre-printMessage\n");
+                printMessage(1, buffer, extentLength);
+                printSeparator(1);
+            }
+        } else if (matched) {
+            //printf("else if (matched)\n");
+            // this is the continuation of the previously matched message
             printMessage(1, buffer, extentLength);
             printSeparator(1);
         }
+
+        //printf("SocketCallback post-should_print_message\n");
 
         length -= extentLength;
         buffer += extentLength;
@@ -314,13 +331,13 @@ static void color_separator(int fd)
 
 #define MAX_ERROR_MSG 0x1000
 
-static int compile_regexp(regex_t * r, const char * regex_text)
+static int compile_regex(regex_t * r, const char * regex_text)
 {
     int status = regcomp(r, regex_text, REG_EXTENDED|REG_NEWLINE);
     if (status != 0) {
 	char error_message[MAX_ERROR_MSG];
 	regerror(status, r, error_message, MAX_ERROR_MSG);
-        fprintf(stderr, "Regexp error compiling '%s': %s\n", regex_text, error_message);
+        fprintf(stderr, "regex error compiling '%s': %s\n", regex_text, error_message);
         return 1;
     }
     return 0;
@@ -329,14 +346,14 @@ static int compile_regexp(regex_t * r, const char * regex_text)
 int main (int argc, char * const argv[])
 {
     if ((argc == 2) && (strcmp(argv[1], "--help") == 0)) {
-        fprintf(stderr, "Usage: %s [options]\nOptions:\n -d\t\t\tInclude connect/disconnect messages in standard out\n -u <udid>\t\tShow only logs from a specific device\n -p <process name>\tShow only logs from a specific process\n -f <regexp>\t\tInclude output that matches <regexp>\n -x <regexp>\t\tExclude output that matches <regexp>\n\nControl-C to disconnect\nMail bug reports and suggestions to <ryan.petrich@medialets.com>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options]\nOptions:\n -d\t\t\tInclude connect/disconnect messages in standard out\n -u <udid>\t\tShow only logs from a specific device\n -p <regex>\t\tShow logs from a process that matches <regex>\n\nControl-C to disconnect\nMail bug reports and suggestions to <ryan.petrich@medialets.com>\n", argv[0]);
         return 1;
     }
     int c;
     bool use_separators = false;
     bool force_color = false;
 
-    while ((c = getopt(argc, argv, "dcsu:p:f:x:")) != -1)
+    while ((c = getopt(argc, argv, "dcsu:p:")) != -1)
         switch (c)
     {
         case 'd':
@@ -354,59 +371,18 @@ int main (int argc, char * const argv[])
             requiredDeviceId = CFStringCreateWithCString(kCFAllocatorDefault, optarg, kCFStringEncodingASCII);
             break;
         case 'p':
-            if (optarg) {
-                requiredProcessName = malloc(strlen(optarg) + 1);
-                if (!requiredProcessName) {
-                    fprintf(stderr, "Failed to allocate memory for requiredProcessName\n");
-                    return 0;
-                }
-                requiredProcessName[strlen(optarg)] = '\0';
-                strcpy(requiredProcessName, optarg);
-            } else {
-                requiredProcessName = malloc(strlen(match_all) + 1);
-                if (!requiredProcessName) {
-                    fprintf(stderr, "Failed to allocate memory for requiredProcessName\n");
-                    return 0;
-                }
-                requiredProcessName[strlen(match_all)] = '\0';
-                strcpy(requiredProcessName, match_all);
+            requiredProcessName = malloc(strlen(optarg) + 1);
+            if (!requiredProcessName) {
+                fprintf(stderr, "Failed to allocate memory for requiredProcessName\n");
+                return 0;
             }
+            requiredProcessName[strlen(optarg)] = '\0';
+            strcpy(requiredProcessName, optarg);
 
-            if (compile_regexp(&requiredProcessNamePattern, requiredProcessName)) {
+            if (compile_regex(&requiredProcessNamePattern, requiredProcessName)) {
+                fprintf(stderr, "Failed to compile process name regex: %s\n", requiredProcessName);
                 return 1;
             }
-            break;
-        case 'f':
-            if (optarg) {
-                includeStrPattern = malloc(strlen(optarg) + 1);
-                if (!includeStrPattern) {
-                    fprintf(stderr, "Failed to allocate memory for includeStrPattern\n");
-                    return 0;
-                }
-                includeStrPattern[strlen(optarg)] = '\0';
-                strcpy(includeStrPattern, optarg);
-
-                if (compile_regexp(&includePattern, includeStrPattern)) {
-                    return 1;
-                }
-            }
-
-            break;
-        case 'x':
-            if (optarg) {
-                excludeStrPattern = malloc(strlen(optarg) + 1);
-                if (!excludeStrPattern) {
-                    fprintf(stderr, "Failed to allocate memory for excludeStrPattern\n");
-                    return 0;
-                }
-                excludeStrPattern[strlen(optarg)] = '\0';
-                strcpy(excludeStrPattern, optarg);
-
-                if (compile_regexp(&excludePattern, excludeStrPattern)) {
-                    return 1;
-                }
-            }
-
             break;
         case '?':
             if (optopt == 'u')
@@ -419,6 +395,14 @@ int main (int argc, char * const argv[])
         default:
             abort();
     }
+
+    if (compile_regex(&monthDayPattern, month_day)) {
+        fprintf(stderr, "Failed to compile console timestamp regex: %s\n", month_day);
+        return 1;
+    }
+
+    //printf("monthDayPattern: %s\n", month_day);
+    //printf("requiredProcessName:: %s\n", requiredProcessName);
 
     if (force_color || isatty(1)) {
         printMessage = &write_colored;
